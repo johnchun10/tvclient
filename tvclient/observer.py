@@ -40,9 +40,11 @@ class ExecutionObserver:
         source: Literal["fork", "live", "fresh"],
         depth: int,
         env_id: Optional[str],
+        from_bank: bool = False,
     ) -> None:
         """A miss picked its resume point: `depth` entries of ctx.path are
-        already applied in the sandbox."""
+        already applied in the sandbox. from_bank: the sandbox came ready-made
+        from the fork bank (a warm root or a pre-forked copy)."""
 
     async def on_executed(
         self,

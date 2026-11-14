@@ -1,6 +1,7 @@
 """Per-rollout tool call executor backed by the TVCache."""
 
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -10,8 +11,8 @@ from typing import List, Optional, Tuple, Type
 from tvclient.client import FindResult, TVCacheClient
 from tvclient.sandbox import Sandbox
 from tvclient.fork_bank import ROOT_ENV_ID, AbstractForkGenerator
-from tvclient.protocol import validate_embedding
 from tvclient.observer import ExecutionObserver, LookupContext
+from tvclient.protocol import validate_embedding
 from tvclient.snapshot_policy import (
     INITIAL_FORK_COST_SECONDS,
     SNAPSHOT_COST_MULTIPLIER,
@@ -69,6 +70,9 @@ class TvcacheToolExecutor:
         self._ctx: Optional[LookupContext] = None
         # Inserts the server refused (missing parent, or a conflicting value).
         self.rejected_inserts = 0
+        # Whether the environment from the last _fork/_fresh_environment came
+        # ready-made from the fork bank.
+        self._from_bank = False
         # Owns the un-checkpointed replay cost and the adaptive snapshot
         # threshold (backed by the server-side fork-cost EMA).
         self.snapshot_policy = SnapshotPolicy(
@@ -204,7 +208,9 @@ class TvcacheToolExecutor:
         if lpm_usable and lpm_depth > live_depth:
             lpm_sandbox = await self._fork_environment(found.sandbox_id)
             self._replace_rollout_environment(lpm_sandbox, list(tool_call_list[:lpm_depth]))
-            await self.observer.on_resume(self._ctx, "fork", lpm_depth, lpm_sandbox.get_id())
+            await self.observer.on_resume(
+                self._ctx, "fork", lpm_depth, lpm_sandbox.get_id(), self._from_bank
+            )
             self.logger.debug(
                 f"[ENV]: Resuming from forked sandbox at depth {lpm_depth} "
                 f"(live sandbox depth was {live_depth}) for rollout {self.rollout_id}"
@@ -224,7 +230,9 @@ class TvcacheToolExecutor:
 
         environment = await self._fresh_environment()
         self._replace_rollout_environment(environment, [])
-        await self.observer.on_resume(self._ctx, "fresh", 0, environment.get_id())
+        await self.observer.on_resume(
+            self._ctx, "fresh", 0, environment.get_id(), self._from_bank
+        )
         return environment, 0
 
     async def _fork_environment(self, parent_env_id: str) -> Sandbox:
@@ -234,14 +242,15 @@ class TvcacheToolExecutor:
         attaches to the stored snapshot handle and start()s it, which restores
         the snapshot into a fresh live sandbox.
         """
-        if self.fork_generator is not None:
-            bank_env_id = self.fork_generator.get_forked_env(self.task_name, parent_env_id)
-            if bank_env_id is not None:
-                self.logger.debug(
-                    f"[ENV]: Using fork bank copy {bank_env_id} of parent {parent_env_id} "
-                    f"for rollout {self.rollout_id}"
-                )
-                return self.tool_call_env_class(task_name=self.task_name, env_id=bank_env_id)
+        self._from_bank = False
+        bank_env_id = await self._take_from_bank(parent_env_id)
+        if bank_env_id is not None:
+            self._from_bank = True
+            self.logger.debug(
+                f"[ENV]: Using fork bank copy {bank_env_id} of parent {parent_env_id} "
+                f"for rollout {self.rollout_id}"
+            )
+            return self.tool_call_env_class(task_name=self.task_name, env_id=bank_env_id)
 
         lpm_sandbox = self.tool_call_env_class(
             task_name=self.task_name, env_id=parent_env_id
@@ -257,13 +266,14 @@ class TvcacheToolExecutor:
         return lpm_sandbox
 
     async def _fresh_environment(self) -> Sandbox:
-        if self.fork_generator is not None:
-            bank_env_id = self.fork_generator.get_forked_env(self.task_name, ROOT_ENV_ID)
-            if bank_env_id is not None:
-                self.logger.debug(
-                    f"[ENV]: Using warm root environment {bank_env_id} for rollout {self.rollout_id}"
-                )
-                return self.tool_call_env_class(task_name=self.task_name, env_id=bank_env_id)
+        self._from_bank = False
+        bank_env_id = await self._take_from_bank(ROOT_ENV_ID)
+        if bank_env_id is not None:
+            self._from_bank = True
+            self.logger.debug(
+                f"[ENV]: Using warm root environment {bank_env_id} for rollout {self.rollout_id}"
+            )
+            return self.tool_call_env_class(task_name=self.task_name, env_id=bank_env_id)
 
         environment = self.tool_call_env_class(task_name=self.task_name)
         st = time.perf_counter()
@@ -274,6 +284,21 @@ class TvcacheToolExecutor:
             f"in {et - st:.2f} seconds for rollout {self.rollout_id}"
         )
         return environment
+
+    async def _take_from_bank(self, parent_env_id: str) -> Optional[str]:
+        """A ready-made copy of parent_env_id (ROOT_ENV_ID: a warm root) from
+        the fork bank, or None. get_forked_env may be sync or async (a remote
+        bank answers over the network); a failing bank is treated as empty."""
+        if self.fork_generator is None:
+            return None
+        try:
+            env_id = self.fork_generator.get_forked_env(self.task_name, parent_env_id)
+            if inspect.isawaitable(env_id):
+                env_id = await env_id
+        except Exception as error:
+            self.logger.warning(f"[BANK]: get_forked_env failed: {error!r}")
+            return None
+        return env_id
 
     async def _execute_and_insert(
         self,
