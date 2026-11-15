@@ -62,3 +62,45 @@ class Sandbox(ABC):
     async def stop(self) -> None:
         """Stops and deletes this sandbox."""
         ...
+
+    async def state_digest(self) -> Optional[dict]:
+        """Optional: a structured digest of this live sandbox's state (see
+        correctness/tvverify/digest). Workloads that can hash their state
+        override this; the default means "not available". The default
+        equals() compares two sandboxes through it."""
+        return None
+
+    async def equals(self, other: "Sandbox") -> bool:
+        """Optional: whether this live sandbox and `other` (also live) hold the
+        same state. The correctness framework and graph contraction call it,
+        never the executor.
+
+        Graph contraction merges two cached nodes when this returns True, and
+        from then on one node's snapshot and cached results serve both. So
+        report two states as equal only if no later tool call can tell them
+        apart. Each workload decides which state counts, for example ignoring
+        timestamps, but the result should behave like equality, and comparing
+        must not change the compared state.
+
+        Override it directly (e.g. diff two containers' filesystems, compare
+        two database dumps), or implement state_digest() and keep this default,
+        which compares the strict components of both digests. With neither, it
+        raises NotImplementedError, and contraction leaves the pair unmerged.
+        """
+        mine, theirs = await self.state_digest(), await other.state_digest()
+        if mine is None or theirs is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} must implement equals() or state_digest() "
+                "so sandbox states can be compared"
+            )
+
+        # Same rule as StateDigest.strict_hash (correctness/tvverify/digest),
+        # restated here so tvclient does not depend on tvverify.
+        def strict(digest: dict) -> dict:
+            return {
+                name: comp["hash"]
+                for name, comp in digest["components"].items()
+                if comp.get("strict", True)
+            }
+
+        return strict(mine) == strict(theirs)
